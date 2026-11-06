@@ -28,7 +28,7 @@
 #
 # Versão do script (segue versionamento semântico: MAIOR.MENOR.CORREÇÃO).
 # Veja o histórico com: ./rip-cd.sh --changelog
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 SCRIPT_DATE="2026-11-06"
 
 # detectar_pasta_musica
@@ -208,6 +208,10 @@ mostrar_changelog() {
 
 Histórico de versões:
 
+  1.5.1  Corrige travamento da barra de progresso: o bash lia o log do abcde
+         linha a linha e, se o cdparanoia gerasse muito texto, ficava preso
+         a 100% de CPU sem redesenhar. Agora um grep filtra só as linhas
+         de progresso e a barra nunca trava.
   1.5.0  Novas fontes de tags no rip: Retrobridge (CDDB) e, como último
          recurso, o CD-Text gravado no disco (pacote opcional icedax);
          ordem configurável em METADATA_ORDER. O --retag aceita links do
@@ -1330,9 +1334,12 @@ desenhar() {
     DESENHADO=1
 }
 
+# Lê (no máximo por $1 segundos de espera) as linhas de progresso já filtradas.
+# O filtro grep fica fora do bash: se o abcde/cdparanoia despejar milhões de
+# linhas de ruído no log, o bash só vê as poucas linhas "Grabbing/Encoding/Tagging".
 drenar_log() {
     local linha
-    while IFS= read -r -u3 linha; do
+    while IFS= read -r -t "${1:-0.05}" -u3 linha; do
         processar_linha "$linha"
     done
     return 0
@@ -1401,7 +1408,8 @@ if [[ "$USAR_PROGRESSO" == "y" ]]; then
     : > "$LOG_FILE"
     abcde -c "$CONFIG" -d "$CD_DEVICE" > "$LOG_FILE" 2>&1 &
     ABCDE_PID=$!
-    exec 3< "$LOG_FILE"
+    exec 3< <(tail -n +1 -f --pid="$ABCDE_PID" "$LOG_FILE" 2>/dev/null |
+              grep --line-buffered -iE '^[[:space:]]*(grabbing|ripping|encoding|tagging)[[:space:]]+track')
     printf '\033[?25l'                              # esconde o cursor
 
     while :; do
@@ -1413,7 +1421,7 @@ if [[ "$USAR_PROGRESSO" == "y" ]]; then
 
     wait "$ABCDE_PID" || rc=$?
     ABCDE_PID=""
-    drenar_log
+    drenar_log 2        # o tail termina sozinho (--pid) e fecha o canal
     exec 3<&-
 
     if (( rc == 0 )); then CONCLUIDO="y"; fi
