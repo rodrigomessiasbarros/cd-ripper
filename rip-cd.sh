@@ -20,15 +20,19 @@
 #   ./rip-cd.sh -m cddb                  # força o gnudb.org (ou: -m musicbrainz)
 #
 # Corrigir as tags de um álbum que já foi ripado (sem ripar de novo):
-#   ./rip-cd.sh --retag ~/Músicas/CDs-Ripados/Unknown_Artist/Unknown_Album \
+#   ./rip-cd.sh --retag ~/Músicas/CDs-Ripados/Unknown Artist/Unknown Album \
 #               --release https://musicbrainz.org/release-group/ID --dry-run
 #   (tire o --dry-run para aplicar; use o link de um release para fixar a edição)
 #   Também funciona com links do Discogs (/release/ID ou /master/ID):
 #   export DISCOGS_TOKEN=...   # opcional: capa + limite maior (veja --help)
 #
+# Tirar os "_" dos nomes das músicas de um álbum que já foi ripado:
+#   ./rip-cd.sh --fix-names ~/Músicas/Nirvana --dry-run   # só mostra
+#   ./rip-cd.sh --fix-names ~/Músicas/Nirvana             # aplica (pede confirmação)
+#
 # Versão do script (segue versionamento semântico: MAIOR.MENOR.CORREÇÃO).
 # Veja o histórico com: ./rip-cd.sh --changelog
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.6.0"
 SCRIPT_DATE="2026-11-06"
 
 # detectar_pasta_musica
@@ -134,6 +138,7 @@ PACOTES_OPCIONAIS=(icedax)
 
 OS_RELEASE="${OS_RELEASE:-/etc/os-release}"
 RETAG_DIRS=()
+FIXNAMES_DIRS=()
 RETAG_RELEASE=""
 RETAG_DISC=0
 RETAG_MOVE="y"
@@ -186,6 +191,13 @@ Corrigir as tags de um álbum já ripado (sem ripar de novo):
       --force                Aplica mesmo se a duração da faixa não bater (±4 s)
   Os arquivos vão para DESTINO/Artista/Álbum/ (veja -o).
 
+Tirar os "_" dos nomes das músicas de álbuns já ripados:
+      --fix-names PASTA      Pasta de um álbum (ou do artista, com vários álbuns).
+                             Renomeia "01 - Smells_Like_Teen_Spirit.mp3" para
+                             "01 - Smells Like Teen Spirit.mp3", usando a grafia
+                             da tag quando ela confere. Aceita --dry-run e --yes.
+                             Pode repetir a opção.
+
 Dependências (somente Debian, Ubuntu e derivados):
       --install-deps         Instala os pacotes necessários com apt-get
   -y, --yes                  Não pedir confirmação no --install-deps
@@ -210,6 +222,10 @@ mostrar_changelog() {
 
 Histórico de versões:
 
+  1.6.0  Os arquivos e pastas novos saem com espaços (Smells Like Teen
+         Spirit.mp3) em vez de "_" (o abcde troca espaço por "_" por padrão).
+         Nova opção --fix-names PASTA: tira os "_" dos nomes das músicas de
+         álbuns já ripados, usando a grafia da tag quando ela confere.
   1.5.2  Se o leitor sumiu e voltou com outro nome (sr0 -> sr1, comum em
          leitores USB), usa automaticamente o único leitor encontrado,
          desde que você não tenha passado -d.
@@ -986,6 +1002,183 @@ if __name__ == "__main__":
 PY
 }
 
+gerar_helper_nomes() {
+    cat <<'PYN'
+#!/usr/bin/env python3
+# Helper do rip-cd.sh --fix-names: tira os "_" dos nomes dos arquivos de música.
+import argparse
+import os
+import re
+import sys
+import unicodedata
+
+try:
+    import mutagen
+except Exception:                      # sem mutagen só dá para trocar "_" por espaço
+    mutagen = None
+
+EXTS = (".mp3", ".flac", ".ogg", ".opus")
+
+
+def norm(s):
+    """Só letras e números, sem acento nem maiúsculas: para comparar nomes."""
+    s = unicodedata.normalize("NFKD", s).casefold()
+    return "".join(c for c in s if c.isalnum())
+
+
+def sanear(s):
+    """Torna um título aceitável como nome de arquivo, mantendo os espaços."""
+    s = s.replace("/", "-").replace(":", " -")
+    s = re.sub(r'[\\*?"<>|\x00-\x1f]', "", s)
+    return re.sub(r"\s+", " ", s).strip().lstrip(".")
+
+
+def titulo_tag(caminho):
+    if mutagen is None:
+        return None
+    try:
+        f = mutagen.File(caminho, easy=True)
+        if f is None or not f.tags:
+            return None
+        v = f.tags.get("title")
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else None
+        return str(v) if v else None
+    except Exception:
+        return None
+
+
+def tem_audio(pasta):
+    try:
+        return any(n.lower().endswith(EXTS) and os.path.isfile(os.path.join(pasta, n))
+                   for n in os.listdir(pasta))
+    except OSError:
+        return False
+
+
+def achar_albuns(raiz):
+    """A própria pasta, se tiver músicas; senão as subpastas (até 3 níveis) que tiverem."""
+    if tem_audio(raiz):
+        return [raiz]
+    achados = []
+    for atual, subs, _ in os.walk(raiz):
+        if atual[len(raiz):].count(os.sep) >= 3:
+            subs[:] = []
+            continue
+        subs.sort()
+        if atual != raiz and tem_audio(atual):
+            achados.append(atual)
+    return achados
+
+
+def novo_nome(caminho):
+    """Retorna (nome_novo, restaurado_pela_tag) ou None se não há o que mudar."""
+    base, ext = os.path.splitext(os.path.basename(caminho))
+    if "_" not in base:
+        return None
+    m = re.match(r"^(\s*\d{1,3}\s-\s)(.*)$", base)          # "01 - Título"
+    prefixo, resto = (m.group(1), m.group(2)) if m else ("", base)
+    limpo = re.sub(r"\s+", " ", resto.replace("_", " ")).strip()
+    restaurado = False
+    tag = titulo_tag(caminho)
+    if tag and norm(tag) == norm(resto):        # a tag é o mesmo título: usa a grafia dela
+        t = sanear(tag)
+        if t and t != limpo:
+            limpo, restaurado = t, True
+    return prefixo + limpo + ext, restaurado
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", action="append", required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--yes", action="store_true")
+    args = ap.parse_args()
+
+    albuns = []
+    for raiz in args.dir:
+        achados = achar_albuns(raiz)
+        if not achados:
+            print("Erro: não encontrei músicas (%s) em '%s'." % (", ".join(EXTS), raiz), file=sys.stderr)
+            return 1
+        albuns += [a for a in achados if a not in albuns]
+
+    plano, conflitos, restauradas, sem_mudanca = [], [], 0, 0
+    for pasta in albuns:
+        print("\nÁlbum: %s" % pasta)
+        usados = set()
+        nomes = sorted(n for n in os.listdir(pasta)
+                       if n.lower().endswith(EXTS) and os.path.isfile(os.path.join(pasta, n)))
+        for n in nomes:
+            origem = os.path.join(pasta, n)
+            r = novo_nome(origem)
+            if r is None:
+                sem_mudanca += 1
+                continue
+            novo, rest = r
+            destino = os.path.join(pasta, novo)
+            if novo == n:
+                sem_mudanca += 1
+                continue
+            if destino in usados or os.path.exists(destino):
+                conflitos.append(origem)
+                print("  ! já existe um arquivo com o nome novo, pulado: %s" % n)
+                continue
+            usados.add(destino)
+            plano.append((origem, destino))
+            restauradas += rest
+            print("  %s\n    -> %s" % (n, novo))
+
+    print()
+    if not plano:
+        print("Nada a renomear (%d arquivo(s) já estão sem '_')." % sem_mudanca)
+        return 0
+    print("%d arquivo(s) a renomear; %d já estavam bons; %d pulado(s)."
+          % (len(plano), sem_mudanca, len(conflitos)))
+    if restauradas:
+        print("%d nome(s) usaram a grafia da tag (pontuação e apóstrofos preservados)." % restauradas)
+    print("Só os arquivos de música são renomeados; pastas e capas não são tocadas.")
+    if args.dry_run:
+        print("\n(--dry-run: nada foi alterado.)")
+        return 0
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("Erro: sem terminal para confirmar; use --yes.", file=sys.stderr)
+            return 1
+        if input("Renomear? [s/N] ").strip().lower() not in ("s", "sim", "y", "yes"):
+            print("Cancelado.")
+            return 0
+    for origem, destino in plano:
+        os.rename(origem, destino)
+    print("Pronto: %d arquivo(s) renomeado(s)." % len(plano))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYN
+}
+
+executar_nomes() {
+    command -v python3 >/dev/null 2>&1 \
+        || erro "python3 não encontrado. No Debian/Ubuntu: $0 --install-deps"
+    local d helper rc=0 args=()
+    for d in "${FIXNAMES_DIRS[@]}"; do
+        [[ -d "$d" ]] || erro "'$d' não é uma pasta."
+        args+=(--dir "$d")
+    done
+    if ! python3 -c 'import mutagen' 2>/dev/null; then
+        echo "Aviso: módulo mutagen ausente; os '_' viram espaço, mas a grafia das tags não será usada." >&2
+    fi
+    helper="$(mktemp --suffix=.nomes.py)"
+    gerar_helper_nomes > "$helper"
+    if [[ "$RETAG_DRY"   == "y" ]]; then args+=(--dry-run); fi
+    if [[ "$ASSUMIR_SIM" == "y" ]]; then args+=(--yes);     fi
+    python3 -I "$helper" "${args[@]}" || rc=$?
+    rm -f "$helper"
+    return "$rc"
+}
+
 executar_retag() {
     command -v python3 >/dev/null 2>&1 \
         || erro "python3 não encontrado. No Debian/Ubuntu: $0 --install-deps"
@@ -1027,6 +1220,7 @@ while (( $# > 0 )); do
         -m|--metadata)    precisa_valor "$@"; METADATA_SOURCE="$2"; shift 2 ;;
         --no-progress)    MOSTRAR_PROGRESSO="n"; shift ;;
         --retag)          precisa_valor "$@"; RETAG_DIRS+=("$2"); shift 2 ;;
+        --fix-names)      precisa_valor "$@"; FIXNAMES_DIRS+=("$2"); shift 2 ;;
         --release)        precisa_valor "$@"; RETAG_RELEASE="$2"; shift 2 ;;
         --disc)           precisa_valor "$@"; RETAG_DISC="$2"; shift 2 ;;
         --no-move)        RETAG_MOVE="n"; shift ;;
@@ -1045,6 +1239,14 @@ done
 if [[ "$INSTALAR_DEPS" == "y" ]]; then
     instalar_dependencias
     exit 0
+fi
+
+if (( ${#FIXNAMES_DIRS[@]} > 0 )); then
+    (( ${#RETAG_DIRS[@]} == 0 )) && [[ -z "$RETAG_RELEASE" ]] \
+        || erro "--fix-names não combina com --retag/--release; rode um de cada vez."
+    rc_nomes=0
+    executar_nomes || rc_nomes=$?
+    exit "$rc_nomes"
 fi
 
 if (( ${#RETAG_DIRS[@]} > 0 )) || [[ -n "$RETAG_RELEASE" ]]; then
@@ -1180,6 +1382,17 @@ INTERACTIVE=$INTERACTIVE
 EJECTCD=$EJECT_CD
 PADTRACKS=y
 MAXPROCS=2
+EOF
+
+    # O padrão do abcde troca espaço por "_" nos nomes de arquivo e pasta.
+    # Aqui os espaços são mantidos; só saem os caracteres problemáticos.
+    cat >> "$arq" <<'EOF'
+
+mungefilename ()
+{
+    echo "$@" | sed -e 's/^\.*//' -e 's,:, -,g' -e 's,/,-,g' \
+        | tr -d "'\"?<>|*[:cntrl:]" | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
+}
 EOF
 }
 
@@ -1401,7 +1614,7 @@ case "$METADATA_SOURCE" in
         done
         if [[ "$ACHOU" != "y" ]]; then
             SEM_METADADOS="y"
-            echo "  Seguindo com nomes genéricos (Unknown_Artist, Track_N)."
+            echo "  Seguindo com nomes genéricos (Unknown Artist, Track N)."
         fi
         echo "  (log da consulta: $LOG_LOOKUP)"
         ;;
