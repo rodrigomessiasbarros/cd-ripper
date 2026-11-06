@@ -3,7 +3,8 @@
 # rip-cd.sh - Ripa CDs de áudio, converte e organiza em Artista/Álbum/
 #
 # Usa o abcde (que por baixo usa cdparanoia). As tags vêm do MusicBrainz e,
-# se o disco não estiver lá, do CDDB (gnudb.org).
+# se o disco não estiver lá, do GnuDB, do Retrobridge e, por último, do
+# CD-Text gravado no próprio disco.
 # Mostra barras de progresso de ripagem e de conversão.
 #
 # Instalação das dependências (SOMENTE Debian, Ubuntu e derivados):
@@ -22,10 +23,12 @@
 #   ./rip-cd.sh --retag ~/Músicas/CDs-Ripados/Unknown_Artist/Unknown_Album \
 #               --release https://musicbrainz.org/release-group/ID --dry-run
 #   (tire o --dry-run para aplicar; use o link de um release para fixar a edição)
+#   Também funciona com links do Discogs (/release/ID ou /master/ID):
+#   export DISCOGS_TOKEN=...   # opcional: capa + limite maior (veja --help)
 #
 # Versão do script (segue versionamento semântico: MAIOR.MENOR.CORREÇÃO).
 # Veja o histórico com: ./rip-cd.sh --changelog
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 SCRIPT_DATE="2026-11-06"
 
 # detectar_pasta_musica
@@ -90,13 +93,20 @@ EJECT_CD="${EJECT_CD:-y}"
 LOG_FILE="${LOG_FILE:-$HOME/.cache/rip-cd/ultimo-rip.log}"
 
 # Fonte das tags (artista, álbum e nome das faixas):
-#   auto         tenta o MusicBrainz e, se não achar o disco, o CDDB (gnudb.org)
+#   auto         tenta as fontes de METADATA_ORDER, na ordem, até uma achar o disco
 #   musicbrainz  só o MusicBrainz
-#   cddb         só o CDDB (gnudb.org)
+#   gnudb        só o GnuDB (gnudb.org, protocolo CDDB; também aceita "cddb")
+#   retrobridge  só o Retrobridge (protocolo CDDB)
+#   cdtext       só o CD-Text gravado no próprio disco (precisa do pacote icedax)
 METADATA_SOURCE="${METADATA_SOURCE:-auto}"
 
-# Servidor CDDB do fallback. O freedb.org foi desativado; o gnudb.org o substitui.
+# Ordem usada no modo auto. O CD-Text fica por último, como último recurso:
+# não usa internet, mas só existe em alguns discos.
+METADATA_ORDER="${METADATA_ORDER:-musicbrainz gnudb retrobridge cdtext}"
+
+# Servidores CDDB (o freedb.org foi desativado; o gnudb.org o substitui)
 GNUDB_URL="${GNUDB_URL:-http://gnudb.gnudb.org/~cddb/cddb.cgi}"
+RETROBRIDGE_URL="${RETROBRIDGE_URL:-http://cddb.retrobridge.org:80/~cddb/cddb.cgi}"
 
 # Identificação enviada ao servidor CDDB (o protocolo exige usuario@host)
 HELLOINFO="${HELLOINFO:-${USER:-rip-cd}@${HOSTNAME:-localhost}}"
@@ -114,6 +124,11 @@ PACOTES_DEBIAN=(
     eyed3 python3 python3-mutagen
     libmusicbrainz-discid-perl libwww-perl libjson-perl
 )
+
+# Opcional: só habilita o CD-Text (o abcde precisa do cdda2wav "corrigido",
+# que no Debian vem deste pacote). Se não existir na sua versão, o resto
+# continua funcionando normalmente.
+PACOTES_OPCIONAIS=(icedax)
 
 OS_RELEASE="${OS_RELEASE:-/etc/os-release}"
 RETAG_DIRS=()
@@ -149,16 +164,19 @@ Ripagem:
                              Vários separados por vírgula, ex.: flac,mp3
   -i, --interactive          Escolher o resultado quando houver vários
                              (desliga as barras de progresso)
-  -m, --metadata FONTE       auto, musicbrainz ou cddb (padrão: $METADATA_SOURCE)
-                             auto = MusicBrainz e, se não achar, gnudb.org
+  -m, --metadata FONTE       auto, musicbrainz, gnudb, retrobridge ou cdtext
+                             (padrão: $METADATA_SOURCE). No auto a ordem é
+                             $METADATA_ORDER
       --no-progress          Mostra a saída crua do abcde, sem barras
 
 Corrigir as tags de um álbum já ripado (sem ripar de novo):
       --retag PASTA          Pasta com os arquivos do álbum (repita a opção se o
                              álbum estiver dividido em mais de uma pasta)
-      --release LINK         Link (ou ID) da edição no MusicBrainz. Também aceita o
-                             link do release group: o script escolhe a edição pelo
-                             número de faixas e pelas durações
+      --release LINK         Link (ou ID) da edição no MusicBrainz ou no Discogs.
+                             Também aceita o link do release group (MusicBrainz) ou
+                             do master (Discogs): o script escolhe a edição pelo
+                             número de faixas e pelas durações. No Discogs, defina
+                             DISCOGS_TOKEN para baixar a capa (e ter limite maior)
       --disc N               Disco do release, se ele tiver vários
       --no-move              Só grava as tags; não renomeia nem move os arquivos
       --no-cover             Não baixa a capa
@@ -190,6 +208,11 @@ mostrar_changelog() {
 
 Histórico de versões:
 
+  1.5.0  Novas fontes de tags no rip: Retrobridge (CDDB) e, como último
+         recurso, o CD-Text gravado no disco (pacote opcional icedax);
+         ordem configurável em METADATA_ORDER. O --retag aceita links do
+         Discogs (release ou master); defina DISCOGS_TOKEN para a capa e
+         para subir o limite de 25 para 60 requisições por minuto.
   1.4.0  Detecta a pasta de músicas que já existe (prefere Músicas, criada
          por você, à pasta padrão do sistema, Música). Novo modo --retag:
          corrige as tags de um álbum já ripado a partir de um link do
@@ -247,6 +270,7 @@ instalar_dependencias() {
     echo "Sistema detectado: ${PRETTY_NAME:-$ID} (Debian/Ubuntu ou derivado)"
     echo "Pacotes que serão instalados:"
     echo "  ${PACOTES_DEBIAN[*]}"
+    echo "Opcional (CD-Text): ${PACOTES_OPCIONAIS[*]}"
     echo
 
     if [[ "$ASSUMIR_SIM" != "y" ]]; then
@@ -260,6 +284,12 @@ instalar_dependencias() {
 
     "${sudo_cmd[@]}" apt-get update
     "${sudo_cmd[@]}" apt-get install -y "${PACOTES_DEBIAN[@]}"
+
+    local pacote
+    for pacote in "${PACOTES_OPCIONAIS[@]}"; do
+        "${sudo_cmd[@]}" apt-get install -y "$pacote" \
+            || echo "Aviso: não consegui instalar '$pacote' (opcional); o CD-Text ficará indisponível."
+    done
 
     echo
     echo "Dependências instaladas. Agora é só rodar: $0"
@@ -287,6 +317,7 @@ import shutil
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 try:
@@ -300,8 +331,10 @@ UUID_RE = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 EXTS = (".mp3", ".flac", ".ogg", ".opus")
 TOL = 4.0          # tolerância entre a duração do arquivo e a da faixa (segundos)
 REL_INC = "recordings+artist-credits+release-groups+media"
+# links do Discogs: /release/123-Nome, /master/456, /pt_BR/release/123, api.discogs.com/releases/123
+DISCOGS_RE = re.compile(r"discogs\.com/(?:[^/]+/)?(release|master)s?/(\d+)")
 UA = "rip-cd.sh"
-_ultima = 0.0      # o MusicBrainz pede no máximo 1 requisição por segundo
+_ultima = {}       # site -> hora da última requisição (cada site tem o seu limite)
 
 
 def die(msg):
@@ -309,29 +342,41 @@ def die(msg):
     sys.exit(1)
 
 
+def eh_discogs(host):
+    return host == "discogs.com" or host.endswith(".discogs.com")
+
+
+def intervalo(host):
+    """Segundos entre requisições: MusicBrainz 1/s; Discogs 60/min com token e 25/min sem."""
+    if eh_discogs(host):
+        return 1.1 if os.environ.get("DISCOGS_TOKEN") else 2.5
+    return 1.1
+
+
 def http_get(url, binario=False):
-    global _ultima
+    host = urllib.parse.urlparse(url).hostname or ""
     for tent in (1, 2, 3):
-        espera = 1.1 - (time.time() - _ultima)
+        espera = intervalo(host) - (time.time() - _ultima.get(host, 0.0))
         if espera > 0:
             time.sleep(espera)
-        req = urllib.request.Request(url, headers={
-            "User-Agent": UA,
-            "Accept": "*/*" if binario else "application/json",
-        })
+        cab = {"User-Agent": UA, "Accept": "*/*" if binario else "application/json"}
+        token = os.environ.get("DISCOGS_TOKEN", "").strip()
+        if token and eh_discogs(host):              # o token só é enviado ao Discogs
+            cab["Authorization"] = "Discogs token=" + token
+        req = urllib.request.Request(url, headers=cab)
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 dados = r.read()
-            _ultima = time.time()
+            _ultima[host] = time.time()
             return dados if binario else json.loads(dados.decode("utf-8"))
         except urllib.error.HTTPError as e:
-            _ultima = time.time()
+            _ultima[host] = time.time()
             if e.code in (429, 502, 503, 504) and tent < 3:
-                time.sleep(3 * tent)
+                time.sleep((20 if (e.code == 429 and eh_discogs(host)) else 3) * tent)
                 continue
             raise
         except (urllib.error.URLError, TimeoutError):
-            _ultima = time.time()
+            _ultima[host] = time.time()
             if tent < 3:
                 time.sleep(2 * tent)
                 continue
@@ -345,6 +390,148 @@ def mb(caminho):
 
 def fetch_release(mbid):
     return mb("release/" + mbid + "?inc=" + REL_INC)
+
+
+# ---------------------------------------------------------------- Discogs
+# A resposta do Discogs é convertida para o mesmo formato do MusicBrainz, então
+# o resto do programa (plano, tags, nomes, capa) funciona igual para as duas fontes.
+
+def discogs(caminho):
+    return http_get("https://api.discogs.com/" + caminho)
+
+
+def _nome_discogs(n):
+    return re.sub(r"\s*\(\d+\)$", "", (n or "").strip())      # "All Saints (2)" -> "All Saints"
+
+
+def _credito_discogs(artistas):
+    ac = []
+    for a in artistas or []:
+        nome = _nome_discogs(a.get("name") or a.get("anv"))
+        if not nome:
+            continue
+        j = (a.get("join") or "").strip()
+        jp = "" if not j else (", " if j == "," else " %s " % j)
+        ac.append({"name": nome, "joinphrase": jp, "artist": {"id": None, "name": nome}})
+    if ac:
+        ac[-1]["joinphrase"] = ""
+    return ac
+
+
+def _ms_discogs(s):
+    """'3:41' ou '1:02:03' ou '221' (segundos) -> milissegundos; None se não der."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    if ":" in s:
+        partes = s.split(":")
+        if not all(p.isdigit() for p in partes):
+            return None
+        seg = 0
+        for p in partes:
+            seg = seg * 60 + int(p)
+        return seg * 1000
+    return int(s) * 1000 if s.isdigit() else None
+
+
+def _data_discogs(d):
+    r = re.sub(r"(-00)+$", "", (d.get("released") or "").strip())   # "1998-11-00" -> "1998-11"
+    if re.match(r"^\d{4}(-\d{2}){0,2}$", r):
+        return r
+    return str(d["year"]) if d.get("year") else ""
+
+
+def normalizar_discogs(d):
+    faixas = []
+    for e in d.get("tracklist") or []:
+        tipo = e.get("type_") or "track"
+        if tipo == "heading":
+            continue
+        if tipo == "index" and e.get("sub_tracks"):
+            faixas.extend(e["sub_tracks"])
+        elif e.get("title"):
+            faixas.append(e)
+    discos = {}
+    for t in faixas:                                  # posições "2-5" = disco 2, faixa 5
+        m = re.match(r"^[A-Za-z]*(\d+)-(\d+)$", str(t.get("position") or ""))
+        discos.setdefault(int(m.group(1)) if m else 1, []).append(t)
+    media = []
+    for nd in sorted(discos):
+        trs = []
+        for i, t in enumerate(discos[nd], 1):
+            trs.append({"position": i, "number": str(i), "title": t["title"],
+                        "length": _ms_discogs(t.get("duration")),
+                        "artist-credit": _credito_discogs(t.get("artists")) or None,
+                        "recording": {}})
+        media.append({"position": nd, "track-count": len(trs), "tracks": trs})
+    rid = str(d.get("id"))
+    return {"id": rid, "fonte": "discogs", "url": "https://www.discogs.com/release/" + rid,
+            "title": d.get("title") or "?", "date": _data_discogs(d), "country": d.get("country"),
+            "artist-credit": _credito_discogs(d.get("artists")), "media": media,
+            "_imagens": d.get("images") or []}
+
+
+def escolher_do_master(mid, arquivos, args):
+    n = len(arquivos)
+    versoes = []
+    for pagina in (1, 2, 3):
+        d = discogs("masters/%d/versions?per_page=100&page=%d" % (mid, pagina))
+        versoes.extend(d.get("versions") or [])
+        if pagina >= ((d.get("pagination") or {}).get("pages") or 1):
+            break
+    if not versoes:
+        die("o master do Discogs não tem versões listadas.")
+    cds = [v for v in versoes
+           if "CD" in (v.get("format") or "") or "CD" in (v.get("major_formats") or [])]
+    base = cds or versoes
+    base.sort(key=lambda v: (str(v.get("released") or "9999"), v.get("id") or 0))
+    analisar = base[:8]
+    pont, vistas = [], []
+    for v in analisar:
+        full = normalizar_discogs(discogs("releases/%d" % v["id"]))
+        vistas.append(full)
+        try:
+            md = escolher_medium(full, n, args.disc)
+        except ValueError:
+            continue
+        if len(md["tracks"]) == n:
+            pont.append((pontuar(md, arquivos), full))
+    if not pont:
+        print("Nenhuma das %d versões analisadas tem %d faixas:" % (len(analisar), n))
+        for f in vistas:
+            print("  %-10s %-3s %s faixas  %s" % (
+                f["date"] or "?", f.get("country") or "??",
+                "+".join(str(m["track-count"]) for m in f["media"]) or "0", f["url"]))
+        if len(base) > len(analisar):
+            print("(outras %d versões não foram analisadas.)" % (len(base) - len(analisar)))
+        die("passe o link da versão certa em --release.")
+    pont.sort(key=lambda x: x[0])
+    print("%d versão(ões) do Discogs com %d faixas; melhores pela duração:" % (len(pont), n))
+    for i, (sc, full) in enumerate(pont[:5], 1):
+        print("  %d. %-10s %-3s %s  (dif. média %.1fs)  %s" % (
+            i, full["date"] or "?", full.get("country") or "??", full["title"], sc, full["url"]))
+    print("-> usando a opção 1. Para outra, rode de novo com o link da versão em --release.")
+    return pont[0][1]
+
+
+def resolver_discogs(tipo, ident, arquivos, args):
+    if not os.environ.get("DISCOGS_TOKEN"):
+        print("Dica: sem a variável DISCOGS_TOKEN o Discogs limita a 25 requisições por minuto"
+              " e não entrega a capa.")
+    try:
+        if tipo == "release":
+            return normalizar_discogs(discogs("releases/%d" % ident))
+        return escolher_do_master(ident, arquivos, args)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            die("o Discogs não encontrou o %s %d." % (tipo, ident))
+        if e.code in (401, 403):
+            die("o Discogs recusou o acesso (HTTP %d); confira o DISCOGS_TOKEN." % e.code)
+        if e.code == 429:
+            die("limite de requisições do Discogs excedido; espere um minuto ou use DISCOGS_TOKEN.")
+        die("o Discogs respondeu HTTP %d." % e.code)
+    except (urllib.error.URLError, TimeoutError) as e:
+        die("não consegui falar com o Discogs: %s" % e)
 
 
 def credito(ac):
@@ -463,9 +650,12 @@ def escolher_do_grupo(rgid, arquivos, args):
 
 
 def resolver_release(ref, arquivos, args):
+    dm = DISCOGS_RE.search(ref)
+    if dm:
+        return resolver_discogs(dm.group(1), int(dm.group(2)), arquivos, args)
     m = UUID_RE.search(ref)
     if not m:
-        die("não encontrei um ID do MusicBrainz em: " + ref)
+        die("não encontrei um ID do MusicBrainz nem um link do Discogs em: " + ref)
     mbid = m.group(0).lower()
     if "release-group" in ref:
         tipo = "grupo"
@@ -518,13 +708,15 @@ def etiquetar(caminho, rel, medium, t):
     }
     if rel.get("date"):
         tags["date"] = rel["date"]
-    extras = {
-        "musicbrainz_albumid": rel["id"],
-        "musicbrainz_trackid": rec.get("id"),
-        "musicbrainz_artistid": [c["artist"]["id"] for c in ac_t if c.get("artist")],
-        "musicbrainz_albumartistid": [c["artist"]["id"] for c in ac_rel if c.get("artist")],
-        "musicbrainz_releasegroupid": (rel.get("release-group") or {}).get("id"),
-    }
+    extras = {}
+    if rel.get("fonte") != "discogs":                 # IDs do MusicBrainz só quando a fonte é ele
+        extras = {
+            "musicbrainz_albumid": rel["id"],
+            "musicbrainz_trackid": rec.get("id"),
+            "musicbrainz_artistid": [c["artist"]["id"] for c in ac_t if c.get("artist")],
+            "musicbrainz_albumartistid": [c["artist"]["id"] for c in ac_rel if c.get("artist")],
+            "musicbrainz_releasegroupid": (rel.get("release-group") or {}).get("id"),
+        }
     f = mutagen.File(caminho, easy=True)
     if f is None:
         raise ValueError("formato não suportado")
@@ -549,13 +741,32 @@ def pasta_album(dest, rel, medium):
     return os.path.join(dest, seguro(credito(rel.get("artist-credit"))), nome)
 
 
-def obter_capa(mbid):
-    """Baixa a capa frontal (500 px) do Cover Art Archive. Devolve os bytes ou None."""
+def url_release(rel):
+    return rel.get("url") or ("https://musicbrainz.org/release/" + rel["id"])
+
+
+def obter_capa(rel):
+    """Devolve (bytes da imagem ou None, texto de status)."""
+    if rel.get("fonte") == "discogs":
+        if not os.environ.get("DISCOGS_TOKEN"):
+            return None, "não baixada: o Discogs só entrega imagens com token (variável DISCOGS_TOKEN)"
+        imgs = rel.get("_imagens") or []
+        img = next((i for i in imgs if i.get("type") == "primary"), imgs[0] if imgs else None) or {}
+        uri = img.get("uri") or img.get("resource_url")
+        if not uri:
+            return None, "o Discogs não tem imagem para esta edição"
+        try:
+            dados = http_get(uri, binario=True)
+        except Exception as e:
+            return None, "falhou ao baixar do Discogs (%s)" % e
+        return (dados, "baixada do Discogs") if len(dados) >= 1000 else (None, "imagem do Discogs inválida")
     try:
-        dados = http_get("https://coverartarchive.org/release/" + mbid + "/front-500", binario=True)
-        return dados if len(dados) >= 1000 else None
+        dados = http_get("https://coverartarchive.org/release/" + rel["id"] + "/front-500", binario=True)
+        if len(dados) >= 1000:
+            return dados, "encontrada no Cover Art Archive (500 px)"
     except Exception:
-        return None
+        pass
+    return None, "não encontrada no Cover Art Archive"
 
 
 def _imagem(dados):
@@ -668,10 +879,11 @@ def main():
         die(str(e))
     plano = montar_plano(medium, arquivos, args.force)
 
-    print("\nEdição: %s - %s (%s%s)" % (
+    print("\nEdição [%s]: %s - %s (%s%s)" % (
+        "Discogs" if rel.get("fonte") == "discogs" else "MusicBrainz",
         credito(rel.get("artist-credit")), rel["title"], (rel.get("date") or "?")[:4],
         ", " + rel["country"] if rel.get("country") else ""))
-    print("        https://musicbrainz.org/release/" + rel["id"])
+    print("        " + url_release(rel))
     print("        %d faixa(s) nesta edição\n" % len(medium["tracks"]))
     for p in plano:
         a, t = p["a"], p["t"]
@@ -701,10 +913,11 @@ def main():
     album_dir = None if args.no_move else pasta_album(dest, rel, medium)
     ok = pulados = falhas = embutidas = 0
     pastas_ok = set()
-    capa = None if args.no_cover else obter_capa(rel["id"])
-    print("capa: %s\n" % ("encontrada no Cover Art Archive" if capa
-                          else ("desligada (--no-cover)" if args.no_cover
-                                else "não encontrada no Cover Art Archive")))
+    if args.no_cover:
+        capa, msg_capa = None, "desligada (--no-cover)"
+    else:
+        capa, msg_capa = obter_capa(rel)
+    print("capa: %s\n" % msg_capa)
     for p in plano:
         a, t = p["a"], p["t"]
         if p["estado"] != "ok":
@@ -838,10 +1051,22 @@ fi
 #  Verificações
 # ------------------------------------------------------------
 
+[[ "$METADATA_SOURCE" != "cddb" ]] || METADATA_SOURCE="gnudb"     # nome antigo da opção
+METADATA_ORDER="${METADATA_ORDER//cddb/gnudb}"
 case "$METADATA_SOURCE" in
-    auto|musicbrainz|cddb) ;;
-    *) erro "--metadata deve ser auto, musicbrainz ou cddb (recebi '$METADATA_SOURCE')." ;;
+    auto|musicbrainz|gnudb|retrobridge|cdtext) ;;
+    *) erro "--metadata deve ser auto, musicbrainz, gnudb, retrobridge ou cdtext (recebi '$METADATA_SOURCE')." ;;
 esac
+for _fonte in $METADATA_ORDER; do
+    case "$_fonte" in
+        musicbrainz|gnudb|retrobridge|cdtext) ;;
+        *) erro "METADATA_ORDER tem uma fonte inválida: '$_fonte'." ;;
+    esac
+done
+if [[ "$METADATA_SOURCE" == "cdtext" ]] && ! command -v cdda2wav >/dev/null 2>&1 \
+        && ! command -v icedax >/dev/null 2>&1; then
+    erro "o CD-Text precisa do pacote icedax (sudo apt install icedax)."
+fi
 
 faltando=()
 for cmd in abcde cdparanoia eject timeout; do
@@ -878,6 +1103,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 CONFIG="$(mktemp --suffix=.abcde.conf)"
 CONFIG_LOOKUP=""     # config da consulta de tags (some depois de cada consulta)
 LOOKUP_TMP=""        # pasta temporária da consulta
+MOTIVO_PULO=""       # por que uma fonte de tags foi pulada
 ABCDE_PID=""
 
 limpar() {
@@ -903,10 +1129,14 @@ fi
 gerar_config() {
     local arq="$1" metodo="$2" saida="$3" wav="$4" bloco_meta
     case "$metodo" in
-        cddb) bloco_meta="CDDBMETHOD=cddb
+        gnudb)       bloco_meta="CDDBMETHOD=cddb
 CDDBURL=\"$GNUDB_URL\"
 HELLOINFO=\"$HELLOINFO\"" ;;
-        *)    bloco_meta="CDDBMETHOD=musicbrainz" ;;
+        retrobridge) bloco_meta="CDDBMETHOD=cddb
+CDDBURL=\"$RETROBRIDGE_URL\"
+HELLOINFO=\"$HELLOINFO\"" ;;
+        cdtext)      bloco_meta="CDDBMETHOD=cdtext" ;;
+        *)           bloco_meta="CDDBMETHOD=musicbrainz" ;;
     esac
 
     cat > "$arq" <<EOF
@@ -933,11 +1163,28 @@ MAXPROCS=2
 EOF
 }
 
+# nome_fonte MÉTODO -> nome amigável para as mensagens
+nome_fonte() {
+    case "$1" in
+        musicbrainz) echo "MusicBrainz" ;;
+        gnudb)       echo "GnuDB (gnudb.org)" ;;
+        retrobridge) echo "Retrobridge" ;;
+        cdtext)      echo "CD-Text (gravado no disco)" ;;
+        *)           echo "$1" ;;
+    esac
+}
+
 # consultar_metadados MÉTODO
 # Roda só a ação de consulta do abcde (nada é ripado nem ejetado).
-# Retorna 0 se o disco foi encontrado; 1 se não foi ou se a consulta falhou.
+# Retorna 0 se o disco foi encontrado; 1 se não foi ou se a consulta falhou;
+# 2 se a fonte foi pulada por falta de ferramenta (motivo em MOTIVO_PULO).
 consultar_metadados() {
     local metodo="$1" saida rc=0
+    if [[ "$metodo" == "cdtext" ]] && ! command -v cdda2wav >/dev/null 2>&1 \
+            && ! command -v icedax >/dev/null 2>&1; then
+        MOTIVO_PULO="pacote icedax não instalado: sudo apt install icedax"
+        return 2
+    fi
     CONFIG_LOOKUP="$(mktemp --suffix=.abcde-lookup.conf)"
     LOOKUP_TMP="$(mktemp -d)"
     gerar_config "$CONFIG_LOOKUP" "$metodo" "$LOOKUP_TMP" "$LOOKUP_TMP"
@@ -1116,26 +1363,28 @@ LOG_LOOKUP="${LOG_FILE%.log}-consulta.log"
 : > "$LOG_LOOKUP"
 
 case "$METADATA_SOURCE" in
-    musicbrainz|cddb)
-        METODO_ESCOLHIDO="$METADATA_SOURCE"
-        echo "Fonte das tags: $METODO_ESCOLHIDO (definida por --metadata)"
-        ;;
     auto)
-        echo "Procurando as tags do disco..."
-        if consultar_metadados musicbrainz; then
-            echo "  $C_OK encontrado no MusicBrainz"
-        else
-            echo "  x não encontrado no MusicBrainz; tentando o CDDB (gnudb.org)..."
-            if consultar_metadados cddb; then
-                METODO_ESCOLHIDO="cddb"
-                echo "  $C_OK encontrado no gnudb.org"
-            else
-                SEM_METADADOS="y"
-                echo "  x não encontrado no gnudb.org"
-                echo "  Seguindo com nomes genéricos (Unknown_Artist, Track_N)."
-            fi
+        echo "Procurando as tags do disco (ordem: $METADATA_ORDER)..."
+        ACHOU="n"
+        for fonte in $METADATA_ORDER; do
+            rc_fonte=0
+            consultar_metadados "$fonte" || rc_fonte=$?
+            case "$rc_fonte" in
+                0)  echo "  $C_OK $(nome_fonte "$fonte"): encontrado"
+                    METODO_ESCOLHIDO="$fonte"; ACHOU="y"; break ;;
+                2)  echo "  - $(nome_fonte "$fonte"): pulado ($MOTIVO_PULO)" ;;
+                *)  echo "  x $(nome_fonte "$fonte"): não encontrado" ;;
+            esac
+        done
+        if [[ "$ACHOU" != "y" ]]; then
+            SEM_METADADOS="y"
+            echo "  Seguindo com nomes genéricos (Unknown_Artist, Track_N)."
         fi
         echo "  (log da consulta: $LOG_LOOKUP)"
+        ;;
+    *)
+        METODO_ESCOLHIDO="$METADATA_SOURCE"
+        echo "Fonte das tags: $(nome_fonte "$METADATA_SOURCE") (definida por --metadata)"
         ;;
 esac
 echo
@@ -1185,7 +1434,7 @@ if (( rc == 0 )); then
     echo "Concluído! Arquivos em: $DEST_DIR"
     if [[ "$SEM_METADADOS" == "y" ]]; then
         echo
-        echo "O disco não está no MusicBrainz nem no gnudb, então os arquivos ficaram sem tags."
+        echo "Nenhuma fonte conhecia este disco, então os arquivos ficaram sem tags."
         echo "Abra a pasta no MusicBrainz Picard e use \"Escanear\" (impressão digital de áudio)."
     fi
 else
