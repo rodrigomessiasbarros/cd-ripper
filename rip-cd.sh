@@ -28,7 +28,7 @@
 #
 # Versão do script (segue versionamento semântico: MAIOR.MENOR.CORREÇÃO).
 # Veja o histórico com: ./rip-cd.sh --changelog
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 SCRIPT_DATE="2026-11-06"
 
 # detectar_pasta_musica
@@ -60,6 +60,8 @@ detectar_pasta_musica() {
 # ============================================================
 
 # Leitor de CD (fonte). Para ver os seus: ls /dev/sr* ou lsblk
+CD_DEVICE_AUTO="y"                       # "y" = ninguém escolheu o leitor; pode detectar
+[[ -z "${CD_DEVICE:-}" ]] || CD_DEVICE_AUTO="n"
 CD_DEVICE="${CD_DEVICE:-/dev/sr0}"
 
 # Pasta de destino dos arquivos ripados.
@@ -208,6 +210,9 @@ mostrar_changelog() {
 
 Histórico de versões:
 
+  1.5.2  Se o leitor sumiu e voltou com outro nome (sr0 -> sr1, comum em
+         leitores USB), usa automaticamente o único leitor encontrado,
+         desde que você não tenha passado -d.
   1.5.1  Corrige travamento da barra de progresso: o bash lia o log do abcde
          linha a linha e, se o cdparanoia gerasse muito texto, ficava preso
          a 100% de CPU sem redesenhar. Agora um grep filtra só as linhas
@@ -1015,7 +1020,7 @@ executar_retag() {
 
 while (( $# > 0 )); do
     case "$1" in
-        -d|--device)      precisa_valor "$@"; CD_DEVICE="$2"; shift 2 ;;
+        -d|--device)      precisa_valor "$@"; CD_DEVICE="$2"; CD_DEVICE_AUTO="n"; shift 2 ;;
         -o|--output)      precisa_valor "$@"; DEST_DIR="$2"; DEST_AUTO="n"; shift 2 ;;
         -t|--type)        precisa_valor "$@"; OUTPUT_TYPE="$2"; shift 2 ;;
         -i|--interactive) INTERACTIVE="y"; shift ;;
@@ -1086,6 +1091,17 @@ if (( ${#faltando[@]} > 0 )); then
     echo "Erro: comandos não encontrados: ${faltando[*]}" >&2
     echo "No Debian/Ubuntu, instale tudo com: $0 --install-deps" >&2
     exit 1
+fi
+
+# Leitores USB às vezes desligam sozinhos e voltam com outro nome (sr0 -> sr1).
+# Se você não escolheu o leitor e só existe um, usa esse.
+if [[ ! -b "$CD_DEVICE" && "$CD_DEVICE_AUTO" == "y" ]]; then
+    _leitores=()
+    for _d in /dev/sr*; do [[ -b "$_d" ]] && _leitores+=("$_d"); done
+    if (( ${#_leitores[@]} == 1 )); then
+        echo "Aviso: '$CD_DEVICE' não existe; usando o único leitor encontrado: ${_leitores[0]}" >&2
+        CD_DEVICE="${_leitores[0]}"
+    fi
 fi
 
 if [[ ! -b "$CD_DEVICE" ]]; then
