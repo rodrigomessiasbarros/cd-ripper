@@ -30,9 +30,13 @@
 #   ./rip-cd.sh --fix-names ~/Músicas/Nirvana --dry-run   # só mostra
 #   ./rip-cd.sh --fix-names ~/Músicas/Nirvana             # aplica (pede confirmação)
 #
+# Embutir a capa (cover.jpg da pasta) nos arquivos de um álbum já ripado:
+#   ./rip-cd.sh --embed-cover ~/Músicas/Metallica --dry-run
+#   ./rip-cd.sh --embed-cover ~/Músicas/Metallica/Load
+#
 # Versão do script (segue versionamento semântico: MAIOR.MENOR.CORREÇÃO).
 # Veja o histórico com: ./rip-cd.sh --changelog
-SCRIPT_VERSION="1.6.1"
+SCRIPT_VERSION="1.7.0"
 SCRIPT_DATE="2026-11-06"
 
 # detectar_pasta_musica
@@ -139,6 +143,7 @@ PACOTES_OPCIONAIS=(icedax)
 OS_RELEASE="${OS_RELEASE:-/etc/os-release}"
 RETAG_DIRS=()
 FIXNAMES_DIRS=()
+EMBED_DIRS=()
 RETAG_RELEASE=""
 RETAG_DISC=0
 RETAG_MOVE="y"
@@ -189,6 +194,7 @@ Corrigir as tags de um álbum já ripado (sem ripar de novo):
       --no-cover             Não baixa a capa
       --dry-run              Mostra o que seria feito, sem alterar nada
       --force                Aplica mesmo se a duração da faixa não bater (±4 s)
+                             (no --embed-cover: troca a capa que já está embutida)
   Os arquivos vão para DESTINO/Artista/Álbum/ (veja -o).
 
 Tirar os "_" dos nomes das músicas de álbuns já ripados:
@@ -197,6 +203,13 @@ Tirar os "_" dos nomes das músicas de álbuns já ripados:
                              "01 - Smells Like Teen Spirit.mp3", usando a grafia
                              da tag quando ela confere. Aceita --dry-run e --yes.
                              Pode repetir a opção.
+
+Embutir a capa nos arquivos de música (para players de celular e do PC):
+      --embed-cover PASTA    Pasta de um álbum (ou do artista, com vários álbuns).
+                             Usa a imagem cover/folder/front/albumart (.jpg ou .png)
+                             que estiver na pasta do álbum. MP3, FLAC, Ogg e Opus.
+                             Pula arquivos que já têm capa (--force troca).
+                             Aceita --dry-run e --yes. Pode repetir a opção.
 
 Dependências (somente Debian, Ubuntu e derivados):
       --install-deps         Instala os pacotes necessários com apt-get
@@ -222,6 +235,11 @@ mostrar_changelog() {
 
 Histórico de versões:
 
+  1.7.0  Nova opção --embed-cover PASTA: embute a imagem de capa da pasta
+         (cover.jpg, folder.jpg, front.png...) nos arquivos de um álbum, ou de
+         todos os álbuns dentro da pasta. Funciona com MP3, FLAC, Ogg e Opus.
+         Pula quem já tem capa (use --force para trocar). Players de celular,
+         como o Musicolet, usam a capa embutida nas tags.
   1.6.1  Corrige MP3 ripados sem nenhuma tag: quando a fonte não traz o
          gênero, o abcde passa "-G 255" ao eyeD3 0.9.x, que recusa o valor e
          NÃO grava as tags (sem erro no log). O script agora troca o 255 por
@@ -1164,6 +1182,217 @@ if __name__ == "__main__":
 PYN
 }
 
+gerar_helper_capa() {
+    cat <<'PYC'
+#!/usr/bin/env python3
+# Helper do rip-cd.sh --embed-cover: embute a imagem de capa da pasta nos arquivos de música.
+import argparse
+import base64
+import os
+import sys
+
+try:
+    import mutagen
+except Exception:
+    print("Erro: módulo mutagen ausente. No Debian/Ubuntu: rip-cd.sh --install-deps (python3-mutagen).",
+          file=sys.stderr)
+    sys.exit(1)
+
+EXTS = (".mp3", ".flac", ".ogg", ".opus")
+# Nomes de imagem procurados na pasta do álbum, nesta ordem (sem diferenciar maiúsculas)
+NOMES = ["cover", "folder", "front", "albumart", "album"]
+IMGS = (".jpg", ".jpeg", ".png")
+GRANDE = 1500 * 1024
+
+
+def tem_audio(pasta):
+    try:
+        return any(n.lower().endswith(EXTS) and os.path.isfile(os.path.join(pasta, n))
+                   for n in os.listdir(pasta))
+    except OSError:
+        return False
+
+
+def achar_albuns(raiz):
+    """A própria pasta, se tiver músicas; senão as subpastas (até 3 níveis) que tiverem."""
+    if tem_audio(raiz):
+        return [raiz]
+    achados = []
+    for atual, subs, _ in os.walk(raiz):
+        if atual[len(raiz):].count(os.sep) >= 3:
+            subs[:] = []
+            continue
+        subs.sort()
+        if atual != raiz and tem_audio(atual):
+            achados.append(atual)
+    return achados
+
+
+def achar_capa(pasta):
+    arquivos = {n.lower(): n for n in os.listdir(pasta) if os.path.isfile(os.path.join(pasta, n))}
+    for base in NOMES:
+        for ext in IMGS:
+            if base + ext in arquivos:
+                return os.path.join(pasta, arquivos[base + ext])
+    return None
+
+
+def mime_de(dados):
+    if dados[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if dados[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return None
+
+
+def tem_capa(caminho):
+    ext = os.path.splitext(caminho)[1].lower()
+    try:
+        if ext == ".mp3":
+            from mutagen.id3 import ID3, ID3NoHeaderError
+            try:
+                return bool(ID3(caminho).getall("APIC"))
+            except ID3NoHeaderError:
+                return False
+        if ext == ".flac":
+            from mutagen.flac import FLAC
+            return bool(FLAC(caminho).pictures)
+        f = mutagen.File(caminho)
+        return bool(f is not None and f.tags and f.tags.get("metadata_block_picture"))
+    except Exception:
+        return False
+
+
+def _imagem(dados, mime):
+    from mutagen.flac import Picture
+    p = Picture()
+    p.type = 3                       # capa frontal
+    p.mime = mime
+    p.desc = "Front"
+    p.data = dados
+    return p
+
+
+def embutir(caminho, dados, mime):
+    ext = os.path.splitext(caminho)[1].lower()
+    if ext == ".mp3":
+        from mutagen.id3 import ID3, APIC, ID3NoHeaderError
+        try:
+            t = ID3(caminho)
+        except ID3NoHeaderError:
+            t = ID3()
+        t.delall("APIC")
+        t.add(APIC(encoding=3, mime=mime, type=3, desc="Front", data=dados))
+        t.save(caminho)
+    elif ext == ".flac":
+        from mutagen.flac import FLAC
+        f = FLAC(caminho)
+        f.clear_pictures()
+        f.add_picture(_imagem(dados, mime))
+        f.save()
+    else:
+        f = mutagen.File(caminho)
+        if f is None:
+            raise ValueError("formato não reconhecido")
+        f["metadata_block_picture"] = [base64.b64encode(_imagem(dados, mime).write()).decode("ascii")]
+        f.save()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", action="append", required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--yes", action="store_true")
+    args = ap.parse_args()
+
+    albuns = []
+    for raiz in args.dir:
+        achados = achar_albuns(raiz)
+        if not achados:
+            print("Erro: não encontrei músicas (%s) em '%s'." % (", ".join(EXTS), raiz), file=sys.stderr)
+            return 1
+        albuns += [a for a in achados if a not in albuns]
+
+    plano, sem_imagem = [], []
+    for pasta in albuns:
+        print("\nÁlbum: %s" % pasta)
+        capa = achar_capa(pasta)
+        if capa is None:
+            print("  ! sem imagem de capa na pasta (procurei %s com %s); pulado."
+                  % (", ".join(NOMES), "/".join(IMGS)))
+            sem_imagem.append(pasta)
+            continue
+        dados = open(capa, "rb").read()
+        mime = mime_de(dados)
+        if mime is None:
+            print("  ! '%s' não parece ser JPEG nem PNG; pulado." % os.path.basename(capa))
+            sem_imagem.append(pasta)
+            continue
+        nomes = sorted(n for n in os.listdir(pasta)
+                       if n.lower().endswith(EXTS) and os.path.isfile(os.path.join(pasta, n)))
+        novos = [n for n in nomes if args.force or not tem_capa(os.path.join(pasta, n))]
+        ja = len(nomes) - len(novos)
+        print("  capa: %s (%.0f KB, %s)" % (os.path.basename(capa), len(dados) / 1024.0, mime.split("/")[1]))
+        print("  %d arquivo(s) para receber a capa; %d já tinham%s."
+              % (len(novos), ja, "" if args.force else " (use --force para trocar)"))
+        if len(dados) > GRANDE and novos:
+            print("  ! imagem grande: cada arquivo ficará ~%.1f MB maior." % (len(dados) / 1048576.0))
+        for n in novos:
+            plano.append((os.path.join(pasta, n), dados, mime))
+
+    print()
+    if not plano:
+        print("Nada a fazer.")
+        return 0
+    print("%d arquivo(s) receberão a capa embutida." % len(plano))
+    if args.dry_run:
+        print("\n(--dry-run: nada foi alterado.)")
+        return 0
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("Erro: sem terminal para confirmar; use --yes.", file=sys.stderr)
+            return 1
+        if input("Embutir? [s/N] ").strip().lower() not in ("s", "sim", "y", "yes"):
+            print("Cancelado.")
+            return 0
+    ok, falhas = 0, 0
+    for caminho, dados, mime in plano:
+        try:
+            embutir(caminho, dados, mime)
+            ok += 1
+        except Exception as e:
+            falhas += 1
+            print("  ! falhou em %s: %s" % (os.path.basename(caminho), e))
+    print("Pronto: capa embutida em %d arquivo(s)%s." % (ok, "; %d falharam" % falhas if falhas else ""))
+    return 1 if falhas else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYC
+}
+
+executar_capa() {
+    command -v python3 >/dev/null 2>&1 \
+        || erro "python3 não encontrado. No Debian/Ubuntu: $0 --install-deps"
+    python3 -c 'import mutagen' 2>/dev/null \
+        || erro "módulo mutagen ausente. No Debian/Ubuntu: $0 --install-deps (pacote python3-mutagen)"
+    local d helper rc=0 args=()
+    for d in "${EMBED_DIRS[@]}"; do
+        [[ -d "$d" ]] || erro "'$d' não é uma pasta."
+        args+=(--dir "$d")
+    done
+    helper="$(mktemp --suffix=.capa.py)"
+    gerar_helper_capa > "$helper"
+    if [[ "$RETAG_DRY"   == "y" ]]; then args+=(--dry-run); fi
+    if [[ "$RETAG_FORCE" == "y" ]]; then args+=(--force);   fi
+    if [[ "$ASSUMIR_SIM" == "y" ]]; then args+=(--yes);     fi
+    python3 -I "$helper" "${args[@]}" || rc=$?
+    rm -f "$helper"
+    return "$rc"
+}
+
 executar_nomes() {
     command -v python3 >/dev/null 2>&1 \
         || erro "python3 não encontrado. No Debian/Ubuntu: $0 --install-deps"
@@ -1225,6 +1454,7 @@ while (( $# > 0 )); do
         -m|--metadata)    precisa_valor "$@"; METADATA_SOURCE="$2"; shift 2 ;;
         --no-progress)    MOSTRAR_PROGRESSO="n"; shift ;;
         --retag)          precisa_valor "$@"; RETAG_DIRS+=("$2"); shift 2 ;;
+        --embed-cover)    precisa_valor "$@"; EMBED_DIRS+=("$2"); shift 2 ;;
         --fix-names)      precisa_valor "$@"; FIXNAMES_DIRS+=("$2"); shift 2 ;;
         --release)        precisa_valor "$@"; RETAG_RELEASE="$2"; shift 2 ;;
         --disc)           precisa_valor "$@"; RETAG_DISC="$2"; shift 2 ;;
@@ -1244,6 +1474,18 @@ done
 if [[ "$INSTALAR_DEPS" == "y" ]]; then
     instalar_dependencias
     exit 0
+fi
+
+_modos=0
+if (( ${#FIXNAMES_DIRS[@]} > 0 )); then _modos=$((_modos + 1)); fi
+if (( ${#EMBED_DIRS[@]} > 0 )); then _modos=$((_modos + 1)); fi
+if (( ${#RETAG_DIRS[@]} > 0 )) || [[ -n "$RETAG_RELEASE" ]]; then _modos=$((_modos + 1)); fi
+(( _modos <= 1 )) || erro "use só um destes por vez: --retag, --fix-names ou --embed-cover."
+
+if (( ${#EMBED_DIRS[@]} > 0 )); then
+    rc_capa=0
+    executar_capa || rc_capa=$?
+    exit "$rc_capa"
 fi
 
 if (( ${#FIXNAMES_DIRS[@]} > 0 )); then
