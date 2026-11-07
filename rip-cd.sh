@@ -32,7 +32,7 @@
 #
 # Versão do script (segue versionamento semântico: MAIOR.MENOR.CORREÇÃO).
 # Veja o histórico com: ./rip-cd.sh --changelog
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 SCRIPT_DATE="2026-11-06"
 
 # detectar_pasta_musica
@@ -222,6 +222,11 @@ mostrar_changelog() {
 
 Histórico de versões:
 
+  1.6.1  Corrige MP3 ripados sem nenhuma tag: quando a fonte não traz o
+         gênero, o abcde passa "-G 255" ao eyeD3 0.9.x, que recusa o valor e
+         NÃO grava as tags (sem erro no log). O script agora troca o 255 por
+         12 ("Other"). Ao fim do rip ele também confere se os arquivos novos
+         têm tag de título e avisa se algum ficou sem.
   1.6.0  Os arquivos e pastas novos saem com espaços (Smells Like Teen
          Spirit.mp3) em vez de "_" (o abcde troca espaço por "_" por padrão).
          Nova opção --fix-names PASTA: tira os "_" dos nomes das músicas de
@@ -1327,12 +1332,14 @@ CONFIG_LOOKUP=""     # config da consulta de tags (some depois de cada consulta)
 LOOKUP_TMP=""        # pasta temporária da consulta
 MOTIVO_PULO=""       # por que uma fonte de tags foi pulada
 ABCDE_PID=""
+MARCA=""             # arquivo-marca: o que for mais novo que ele foi criado neste rip
 
 limpar() {
     if [[ -n "$ABCDE_PID" ]] && kill -0 "$ABCDE_PID" 2>/dev/null; then
         kill "$ABCDE_PID" 2>/dev/null || true
     fi
     rm -f "$CONFIG"
+    [[ -z "$MARCA" ]] || rm -f "$MARCA"
     [[ -z "$CONFIG_LOOKUP" ]] || rm -f "$CONFIG_LOOKUP"
     [[ -z "$LOOKUP_TMP" ]] || rm -rf "$LOOKUP_TMP"
     if [[ -t 1 ]]; then printf '\033[?25h'; fi   # devolve o cursor
@@ -1392,6 +1399,21 @@ mungefilename ()
 {
     echo "$@" | sed -e 's/^\.*//' -e 's,:, -,g' -e 's,/,-,g' \
         | tr -d "'\"?<>|*[:cntrl:]" | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
+}
+EOF
+
+    # Sem gênero na fonte, o abcde passa "-G 255" ao eyeD3 0.9.x; o eyeD3 recusa
+    # ("Unknown genre ID: 255"), sai com código 0 e NÃO grava nenhuma tag.
+    # Troca o 255 (indefinido) por 12 ("Other", do padrão ID3).
+    cat >> "$arq" <<'EOF'
+
+eval "$(declare -f do_getgenreid | sed '1s/^do_getgenreid/do_getgenreid_abcde/')"
+do_getgenreid ()
+{
+    local id
+    id="$(do_getgenreid_abcde "$@")"
+    [ "$id" = "255" ] && id=12
+    echo "$id"
 }
 EOF
 }
@@ -1574,6 +1596,43 @@ drenar_log() {
     return 0
 }
 
+# Depois do rip: confere se os arquivos novos têm tag de título.
+verificar_tags() {
+    [[ -n "$MARCA" ]] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 -c 'import mutagen' 2>/dev/null || return 0
+    find "$DEST_DIR" -type f \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.ogg' -o -iname '*.opus' \) \
+        -newer "$MARCA" -print0 2>/dev/null |
+    python3 -I -c '
+import os, sys
+try:
+    import mutagen
+except Exception:
+    sys.exit(0)
+sem, total, pastas = 0, 0, []
+for b in sys.stdin.buffer.read().split(b"\0"):
+    if not b:
+        continue
+    p = os.fsdecode(b)
+    total += 1
+    try:
+        f = mutagen.File(p, easy=True)
+        ok = bool(f is not None and f.tags and f.tags.get("title"))
+    except Exception:
+        ok = False
+    if not ok:
+        sem += 1
+        d = os.path.dirname(p)
+        if d not in pastas:
+            pastas.append(d)
+if sem:
+    print("\nAviso: %d de %d arquivo(s) ficaram SEM tag de título; muitos players não vão listá-los." % (sem, total))
+    for d in pastas[:3]:
+        print("  " + d)
+    print("Corrija com: ./rip-cd.sh --retag \"PASTA\" --release LINK_DO_MUSICBRAINZ")
+' || true
+}
+
 # ------------------------------------------------------------
 #  Execução
 # ------------------------------------------------------------
@@ -1630,6 +1689,7 @@ gerar_config "$CONFIG" "$METODO_ESCOLHIDO" "$DEST_DIR" "$DEST_DIR"
 echo "Iniciando o rip... (Ctrl+C para cancelar)"
 echo
 
+MARCA="$(mktemp)"
 SECONDS=0
 rc=0
 
@@ -1669,6 +1729,7 @@ fi
 echo
 if (( rc == 0 )); then
     echo "Concluído! Arquivos em: $DEST_DIR"
+    verificar_tags
     if [[ "$SEM_METADADOS" == "y" ]]; then
         echo
         echo "Nenhuma fonte conhecia este disco, então os arquivos ficaram sem tags."
